@@ -608,6 +608,8 @@ def upsert_events(ws, events: List[dict]) -> Tuple[int, int, int, Set[str], Set[
     cancelled_iso: Set[str] = set()
     now = datetime.now(tz=LOCAL_TZ)
 
+    conflicts: List[dict] = []
+
     for event in events:
         row_data = event_to_row(event)
         if not row_data:
@@ -637,7 +639,9 @@ def upsert_events(ws, events: List[dict]) -> Tuple[int, int, int, Set[str], Set[
             target_row = by_iso[norm_iso]
         elif lookup_key in by_title_date:
             target_row = by_title_date[lookup_key]
-        elif day_key and day_key in by_day_titles:
+        best_candidate = None
+        best_match_count = 0
+        if day_key and day_key in by_day_titles:
             incoming_title = row_data.get("Event_Title") or ""
             incoming_norm = _normalize_title(incoming_title)
             incoming_words = set(incoming_norm.split())
@@ -654,11 +658,34 @@ def upsert_events(ws, events: List[dict]) -> Tuple[int, int, int, Set[str], Set[
                 matching_words = incoming_words & existing_words
                 if len(matching_words) > max_matching_words:
                     max_matching_words = len(matching_words)
+                    best_candidate = (existing_title, row_idx)
                 if len(matching_words) >= 2:
                     target_row = row_idx
                     break
             if not target_row and max_matching_words >= 1:
                 related_one_word = True
+                # record a conflict for manual review: incoming vs best_candidate
+                if best_candidate:
+                    candidate_title, candidate_row = best_candidate
+                    cand_values = [cell.value for cell in ws[candidate_row - 1]]
+                    cand_iso = None
+                    try:
+                        # read event_dt_iso cell value if present
+                        iso_idx = col_index.get("event_dt_iso")
+                        if iso_idx is not None:
+                            cand_iso = ws.cell(row=candidate_row, column=iso_idx + 1).value
+                    except Exception:
+                        cand_iso = None
+
+                    conflicts.append({
+                        "incoming_title": incoming_title,
+                        "incoming_iso": row_data.get("event_dt_iso"),
+                        "incoming_display": row_data.get("Event Date and Time"),
+                        "candidate_row": candidate_row,
+                        "candidate_title": candidate_title,
+                        "candidate_iso": cand_iso,
+                        "incoming_row": row_data,
+                    })
 
         if target_row:
             # Update the existing row's event_dt_iso cell to canonical value
@@ -692,7 +719,7 @@ def upsert_events(ws, events: List[dict]) -> Tuple[int, int, int, Set[str], Set[
                 by_day_titles.setdefault(str(day_key), []).append((str(row_data["Event_Title"]), insert_at))
             added += 1
 
-    return added, updated, unchanged, active_iso, cancelled_iso
+    return added, updated, unchanged, active_iso, cancelled_iso, conflicts
 
 
 def mark_cancellations(ws, active_iso: Set[str], cancelled_iso: Set[str]) -> int:
@@ -731,7 +758,65 @@ def mark_cancellations(ws, active_iso: Set[str], cancelled_iso: Set[str]) -> int
     return cancelled
 
 
-def sync_events(year: int = TARGET_YEAR) -> None:
+def interactive_resolve(ws, conflicts: List[dict]) -> Tuple[int, int, int]:
+    """Interactively resolve conflicts.
+
+    Returns a tuple (kept, replaced, merged)
+    """
+    headers = ensure_header(ws)
+    col_index = {name: idx for idx, name in enumerate(headers)}
+    kept = 0
+    replaced = 0
+    merged = 0
+
+    for c in conflicts:
+        print("\nPossible duplicate found:")
+        print(f"Incoming: {c.get('incoming_title')} — {c.get('incoming_display')} ({c.get('incoming_iso')})")
+        print(f"Candidate row {c.get('candidate_row')}: {c.get('candidate_title')} — {c.get('candidate_iso')}")
+        print("Action? [k]eep existing / [r]eplace with incoming / [m]erge (update time) / [s]kip")
+        while True:
+            choice = input("Choice (k/r/m/s): ").strip().lower() or "k"
+            if choice in ("k", "r", "m", "s"):
+                break
+            print("Please enter k, r, m or s")
+
+        candidate_row = c.get("candidate_row")
+        incoming_row = c.get("incoming_row") or {}
+
+        if choice == "k" or choice == "s":
+            kept += 1
+            continue
+
+        if choice == "r":
+            # replace all known header columns with incoming values
+            for idx, col in enumerate(headers, start=1):
+                val = incoming_row.get(col)
+                if val is None and col in MANUAL_DEFAULTS:
+                    val = MANUAL_DEFAULTS[col]
+                ws.cell(row=candidate_row, column=idx).value = val
+            _set_row_strike(ws, candidate_row, False)
+            replaced += 1
+            continue
+
+        if choice == "m":
+            # update time-related fields only
+            iso_idx = col_index.get("event_dt_iso")
+            if iso_idx is not None and incoming_row.get("event_dt_iso"):
+                ws.cell(row=candidate_row, column=iso_idx + 1).value = incoming_row.get("event_dt_iso")
+            start_idx = col_index.get("Esitys_Alkaa")
+            end_idx = col_index.get("Esitys_Loppuu")
+            if start_idx is not None and incoming_row.get("Esitys_Alkaa"):
+                ws.cell(row=candidate_row, column=start_idx + 1).value = incoming_row.get("Esitys_Alkaa")
+            if end_idx is not None and incoming_row.get("Esitys_Loppuu"):
+                ws.cell(row=candidate_row, column=end_idx + 1).value = incoming_row.get("Esitys_Loppuu")
+            _set_row_strike(ws, candidate_row, False)
+            merged += 1
+
+    return kept, replaced, merged
+
+
+def sync_events(year: int = TARGET_YEAR, interactive: bool = False, auto_resolve: str = "ask") -> None:
+    # default non-interactive; interactive flag handled in main()
     place_id = fetch_place_id()
     if not place_id:
         print("Savoy Teatteri place not found in Linked Events.")
@@ -758,7 +843,47 @@ def sync_events(year: int = TARGET_YEAR) -> None:
     else:
         ws = wb.create_sheet(SHEET_NAME)
 
-    added, updated, unchanged, active_iso, cancelled_iso = upsert_events(ws, events)
+    added, updated, unchanged, active_iso, cancelled_iso, conflicts = upsert_events(ws, events)
+    # Resolve or record conflicts depending on mode
+    if conflicts:
+        if interactive:
+            kept, replaced, merged = interactive_resolve(ws, conflicts)
+            print(f"Interactive resolution: kept {kept}, replaced {replaced}, merged {merged}")
+        elif auto_resolve == "prefer_incoming":
+            # Replace candidate rows with incoming phrasing/values
+            headers = ensure_header(ws)
+            col_index = {name: idx for idx, name in enumerate(headers)}
+            for c in conflicts:
+                candidate_row = c.get("candidate_row")
+                incoming_row = c.get("incoming_row") or {}
+                # replace title and time-related fields
+                title_idx = col_index.get("Event_Title")
+                iso_idx = col_index.get("event_dt_iso")
+                evt_disp_idx = col_index.get("Event Date and Time")
+                start_idx = col_index.get("Esitys_Alkaa")
+                end_idx = col_index.get("Esitys_Loppuu")
+                if title_idx is not None and incoming_row.get("Event_Title"):
+                    ws.cell(row=candidate_row, column=title_idx + 1).value = incoming_row.get("Event_Title")
+                if iso_idx is not None and incoming_row.get("event_dt_iso"):
+                    ws.cell(row=candidate_row, column=iso_idx + 1).value = incoming_row.get("event_dt_iso")
+                if evt_disp_idx is not None and incoming_row.get("Event Date and Time"):
+                    ws.cell(row=candidate_row, column=evt_disp_idx + 1).value = incoming_row.get("Event Date and Time")
+                if start_idx is not None and incoming_row.get("Esitys_Alkaa"):
+                    ws.cell(row=candidate_row, column=start_idx + 1).value = incoming_row.get("Esitys_Alkaa")
+                if end_idx is not None and incoming_row.get("Esitys_Loppuu"):
+                    ws.cell(row=candidate_row, column=end_idx + 1).value = incoming_row.get("Esitys_Loppuu")
+                _set_row_strike(ws, candidate_row, False)
+            print(f"Auto-resolved {len(conflicts)} conflicts (prefer_incoming).")
+        elif auto_resolve == "prefer_existing":
+            print(f"Left {len(conflicts)} conflicts unchanged (prefer_existing). See 'Conflicts' sheet for details.")
+        else:
+            # write conflicts to sheet 'Conflicts' for review
+            if "Conflicts" in wb.sheetnames:
+                wb.remove(wb["Conflicts"])
+            cws = wb.create_sheet("Conflicts")
+            cws.append(["Incoming Title", "Incoming ISO", "Incoming Display", "Candidate Row", "Candidate Title", "Candidate ISO"])
+            for c in conflicts:
+                cws.append([c.get("incoming_title"), c.get("incoming_iso"), c.get("incoming_display"), c.get("candidate_row"), c.get("candidate_title"), c.get("candidate_iso")])
     cancelled = mark_cancellations(ws, active_iso, cancelled_iso)
     try:
         # If loading failed due to a locked file, avoid overwriting and save to alternate.
@@ -793,6 +918,17 @@ def parse_args() -> argparse.Namespace:
         default=60,
         help="Polling interval in minutes when --watch is set.",
     )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Run interactively and prompt for resolving ambiguous matches.",
+    )
+    parser.add_argument(
+        "--auto-resolve",
+        choices=["ask", "prefer_incoming", "prefer_existing"],
+        default="ask",
+        help="Automatically resolve ambiguous matches: 'prefer_incoming' will replace existing rows with incoming phrasing; 'prefer_existing' keeps sheet as-is; 'ask' (default) leaves for manual review or interactive mode.",
+    )
     return parser.parse_args()
 
 
@@ -801,7 +937,7 @@ def main() -> None:
 
     def job():
         try:
-            sync_events(args.year)
+            sync_events(args.year, interactive=args.interactive, auto_resolve=args.auto_resolve)
         except Exception as exc:
             print(f"Sync failed: {exc}")
 
