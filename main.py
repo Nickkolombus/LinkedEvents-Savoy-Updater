@@ -402,7 +402,11 @@ def build_lookup(ws, headers: List[str]) -> Tuple[Dict[str, int], Dict[Tuple[str
             values[col_index["Event Date and Time"]] if "Event Date and Time" in col_index else None
         )
         if iso_val:
-            by_iso[str(iso_val)] = row_idx
+            norm = _normalize_iso_key(iso_val)
+            if norm:
+                by_iso[norm] = row_idx
+            else:
+                by_iso[str(iso_val)] = row_idx
         if title and date_str:
             by_title_date[(str(title), str(date_str))] = row_idx
     return by_iso, by_title_date
@@ -414,6 +418,75 @@ def _parse_iso_to_dt(value: Optional[str]) -> Optional[datetime]:
     try:
         return datetime.fromisoformat(str(value))
     except ValueError:
+        return None
+
+
+def _normalize_iso_key(value: object) -> Optional[str]:
+    """Normalize various datetime representations into a canonical ISO string in LOCAL_TZ.
+    Handles datetime objects, ISO strings with/without timezone, and common variants.
+    Returns None if parsing fails.
+    """
+    if value is None or value == "":
+        return None
+    # If it's already a datetime
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is None:
+            # treat naive datetimes as local timezone
+            dt = dt.replace(tzinfo=LOCAL_TZ)
+        return dt.astimezone(LOCAL_TZ).isoformat()
+
+    s = str(value).strip()
+    # Try direct ISO parse
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=LOCAL_TZ)
+        return dt.astimezone(LOCAL_TZ).isoformat()
+    except Exception:
+        pass
+
+    # Try common variant 'YYYY-MM-DD HH:MM:SS' by replacing space with 'T'
+    try:
+        dt = datetime.fromisoformat(s.replace(" ", "T"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=LOCAL_TZ)
+        return dt.astimezone(LOCAL_TZ).isoformat()
+    except Exception:
+        return None
+
+
+def _normalize_iso_key(value: object) -> Optional[str]:
+    """Normalize various datetime representations (Excel datetimes, naive strings,
+    ISO strings with/without timezone) into a canonical ISO string in LOCAL_TZ.
+    Returns None if parsing fails.
+    """
+    if value is None or value == "":
+        return None
+    # datetime object
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=LOCAL_TZ)
+        return dt.astimezone(LOCAL_TZ).isoformat()
+
+    s = str(value).strip()
+    # Try direct ISO parse
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=LOCAL_TZ)
+        return dt.astimezone(LOCAL_TZ).isoformat()
+    except Exception:
+        pass
+
+    # Try common variant 'YYYY-MM-DD HH:MM:SS' by replacing space with T
+    try:
+        dt = datetime.fromisoformat(s.replace(" ", "T"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=LOCAL_TZ)
+        return dt.astimezone(LOCAL_TZ).isoformat()
+    except Exception:
         return None
 
 
@@ -540,12 +613,13 @@ def upsert_events(ws, events: List[dict]) -> Tuple[int, int, int, Set[str], Set[
         if not row_data:
             continue
         iso_key = row_data.get("event_dt_iso")
-        if iso_key:
-            active_iso.add(iso_key)
+        norm_iso = _normalize_iso_key(iso_key) if iso_key else None
+        if norm_iso:
+            active_iso.add(norm_iso)
             if event.get("event_status") == "EventCancelled":
-                cancelled_iso.add(iso_key)
+                cancelled_iso.add(norm_iso)
 
-        iso_dt = _parse_iso_to_dt(iso_key)
+        iso_dt = _parse_iso_to_dt(norm_iso)
         # Skip touching past events entirely
         if iso_dt and iso_dt < now:
             continue
@@ -559,8 +633,8 @@ def upsert_events(ws, events: List[dict]) -> Tuple[int, int, int, Set[str], Set[
 
         related_one_word = False
 
-        if iso_key and iso_key in by_iso:
-            target_row = by_iso[iso_key]
+        if norm_iso and norm_iso in by_iso:
+            target_row = by_iso[norm_iso]
         elif lookup_key in by_title_date:
             target_row = by_title_date[lookup_key]
         elif day_key and day_key in by_day_titles:
@@ -587,8 +661,15 @@ def upsert_events(ws, events: List[dict]) -> Tuple[int, int, int, Set[str], Set[
                 related_one_word = True
 
         if target_row:
-            # Skip modifying existing events; only track as unchanged
+            # Update the existing row's event_dt_iso cell to canonical value
             unchanged += 1
+            try:
+                iso_col_idx = col_index.get("event_dt_iso")
+                if iso_col_idx is not None and norm_iso:
+                    ws.cell(row=target_row, column=iso_col_idx + 1).value = norm_iso
+                    _set_row_strike(ws, target_row, False)
+            except Exception:
+                pass
             if day_key and row_data.get("Event_Title"):
                 by_day_titles.setdefault(str(day_key), []).append((str(row_data["Event_Title"]), target_row))
         else:
@@ -628,18 +709,20 @@ def mark_cancellations(ws, active_iso: Set[str], cancelled_iso: Set[str]) -> int
         iso_val = row[iso_col].value
         if not iso_val:
             continue
-        try:
-            iso_dt = datetime.fromisoformat(str(iso_val))
-        except ValueError:
+        norm = _normalize_iso_key(iso_val)
+        if not norm:
+            continue
+        iso_dt = _parse_iso_to_dt(norm)
+        if not iso_dt:
             continue
 
         if iso_dt < now:
             continue
 
-        if str(iso_val) in cancelled_iso:
+        if norm in cancelled_iso:
             _set_row_strike(ws, row_idx, True)
             cancelled += 1
-        elif str(iso_val) not in active_iso:
+        elif norm not in active_iso:
             _set_row_strike(ws, row_idx, True)
             cancelled += 1
         else:
