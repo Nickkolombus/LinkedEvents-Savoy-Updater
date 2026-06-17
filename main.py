@@ -46,7 +46,8 @@ HEADERS = [
     "Event Description",
     "Event Image",
     "event_dt_iso",
-    "Notified",
+    "Notified_6w",
+    "Send Mail",
 ]
 # Columns populated from the API; existing rows are compared against these.
 API_BACKED_FIELDS = [
@@ -359,6 +360,10 @@ def ensure_header(ws) -> List[str]:
         _norm("event_image"): "Event Image",
         _norm("event_dt_iso"): "event_dt_iso",
         _norm("eventdtiso"): "event_dt_iso",
+        _norm("notified"): "Notified_6w",
+        _norm("notified_6w"): "Notified_6w",
+        _norm("send mail"): "Send Mail",
+        _norm("sendmail"): "Send Mail",
     }
 
     # Search for the header row in the first 10 rows (or fewer)
@@ -454,17 +459,19 @@ def ensure_header(ws) -> List[str]:
     # Rebuild normalized_headers in the new order
     normalized_headers = [ws.cell(row=header_row, column=idx).value for idx in range(1, ws.max_column + 1)]
 
-    # Reordering with insert/delete can leave empty trailing columns; clean them up.
-    while ws.max_column > 0:
-        last_col = ws.max_column
+    # Reordering with insert/delete can leave empty columns scattered around;
+    # clean them up from right to left so indices remain stable.
+    col = ws.max_column
+    while col > 0:
         has_data = any(
-            ws.cell(row=r, column=last_col).value not in (None, "")
+            ws.cell(row=r, column=col).value not in (None, "")
             for r in range(1, ws.max_row + 1)
         )
-        if has_data:
-            break
-        ws.delete_cols(last_col)
-        normalized_headers.pop()
+        if not has_data:
+            ws.delete_cols(col)
+            if col <= len(normalized_headers):
+                normalized_headers.pop(col - 1)
+        col -= 1
 
     # Append any missing canonical headers at the end
     missing = [h for h in HEADERS if h not in normalized_headers]
