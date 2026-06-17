@@ -1120,6 +1120,16 @@ def sync_events(year: int = TARGET_YEAR, interactive: bool = False, auto_resolve
     else:
         ws = wb.create_sheet(SHEET_NAME)
 
+    # Remove the default empty sheet that openpyxl creates so Excel opens on
+    # the actual events sheet instead of a blank one.
+    if "Sheet" in wb.sheetnames and wb["Sheet"].max_row <= 1:
+        default_ws = wb["Sheet"]
+        if all(cell.value in (None, "") for cell in default_ws[1]):
+            wb.remove(default_ws)
+
+    # Make the events sheet the active one when the workbook opens.
+    wb.active = wb[SHEET_NAME]
+
     added, updated, unchanged, active_iso, cancelled_iso, conflicts = upsert_events(ws, events)
     # Resolve or record conflicts depending on mode
     if conflicts:
