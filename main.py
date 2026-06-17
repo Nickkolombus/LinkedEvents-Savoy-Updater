@@ -402,9 +402,10 @@ def build_lookup(ws, headers: List[str]) -> Tuple[Dict[str, int], Dict[Tuple[str
             values[col_index["Event Date and Time"]] if "Event Date and Time" in col_index else None
         )
         if iso_val:
-            norm = _normalize_iso_key(iso_val)
-            if norm:
-                by_iso[norm] = row_idx
+            cands = _normalize_iso_candidates(iso_val)
+            if cands:
+                for cand in cands:
+                    by_iso[cand] = row_idx
             else:
                 by_iso[str(iso_val)] = row_idx
         if title and date_str:
@@ -454,6 +455,50 @@ def _normalize_iso_key(value: object) -> Optional[str]:
         return dt.astimezone(LOCAL_TZ).isoformat()
     except Exception:
         return None
+
+
+def _normalize_iso_candidates(value: object) -> Set[str]:
+    """Return a set of plausible normalized ISO strings for a value.
+    This helps recover from sheet values that contain an incorrect timezone
+    offset (for example "+02:00" written for a date that is actually in
+    +03:00 local DST). We return the canonical parsed value plus a "naive-as-local"
+    candidate when possible so lookups tolerate those variants.
+    """
+    candidates: Set[str] = set()
+    primary = _normalize_iso_key(value)
+    if primary:
+        candidates.add(primary)
+
+    # If the raw value is a string with a timezone, also try stripping the
+    # timezone and treating the wall-clock time as local (common when offsets
+    # were mis-saved).
+    try:
+        if isinstance(value, str):
+            s = value.strip()
+            # detect trailing timezone markers like Z or +HH:MM or -HH:MM
+            m = re.match(r"(.+?)(?:Z|[+-]\d{2}:?\d{2})$", s)
+            if m:
+                naive = m.group(1)
+                naive = naive.replace(" ", "T")
+                try:
+                    dt = datetime.fromisoformat(naive)
+                    # treat as local wall-clock
+                    dt = dt.replace(tzinfo=LOCAL_TZ)
+                    candidates.add(dt.astimezone(LOCAL_TZ).isoformat())
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # If value is a datetime with timezone, also allow the naive-as-local variant
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        try:
+            dt_naive_local = value.replace(tzinfo=LOCAL_TZ)
+            candidates.add(dt_naive_local.astimezone(LOCAL_TZ).isoformat())
+        except Exception:
+            pass
+
+    return candidates
 
 
 def _normalize_iso_key(value: object) -> Optional[str]:
@@ -635,8 +680,16 @@ def upsert_events(ws, events: List[dict]) -> Tuple[int, int, int, Set[str], Set[
 
         related_one_word = False
 
-        if norm_iso and norm_iso in by_iso:
-            target_row = by_iso[norm_iso]
+        # Try to match by any plausible normalized ISO candidate
+        matched_by_iso = None
+        if iso_key:
+            iso_cands = _normalize_iso_candidates(iso_key)
+            for cand in iso_cands:
+                if cand in by_iso:
+                    matched_by_iso = by_iso[cand]
+                    break
+        if matched_by_iso:
+            target_row = matched_by_iso
         elif lookup_key in by_title_date:
             target_row = by_title_date[lookup_key]
         best_candidate = None
@@ -692,9 +745,10 @@ def upsert_events(ws, events: List[dict]) -> Tuple[int, int, int, Set[str], Set[
             unchanged += 1
             try:
                 iso_col_idx = col_index.get("event_dt_iso")
+                # write the canonical normalized ISO if available
                 if iso_col_idx is not None and norm_iso:
                     ws.cell(row=target_row, column=iso_col_idx + 1).value = norm_iso
-                    _set_row_strike(ws, target_row, False)
+                _set_row_strike(ws, target_row, False)
             except Exception:
                 pass
             if day_key and row_data.get("Event_Title"):
@@ -736,24 +790,32 @@ def mark_cancellations(ws, active_iso: Set[str], cancelled_iso: Set[str]) -> int
         iso_val = row[iso_col].value
         if not iso_val:
             continue
-        norm = _normalize_iso_key(iso_val)
-        if not norm:
+        cands = _normalize_iso_candidates(iso_val)
+        if not cands:
             continue
-        iso_dt = _parse_iso_to_dt(norm)
+
+        # Prefer the first candidate to parse a datetime for the 'past' check
+        iso_dt = None
+        for cand in cands:
+            iso_dt = _parse_iso_to_dt(cand)
+            if iso_dt:
+                break
         if not iso_dt:
             continue
 
         if iso_dt < now:
             continue
 
-        if norm in cancelled_iso:
+        # If any candidate is known-cancelled, mark cancelled. Otherwise if any
+        # candidate is present in active set, keep active. If none match, mark cancelled.
+        if any(c in cancelled_iso for c in cands):
             _set_row_strike(ws, row_idx, True)
             cancelled += 1
-        elif norm not in active_iso:
-            _set_row_strike(ws, row_idx, True)
-            cancelled += 1
-        else:
+        elif any(c in active_iso for c in cands):
             _set_row_strike(ws, row_idx, False)
+        else:
+            _set_row_strike(ws, row_idx, True)
+            cancelled += 1
 
     return cancelled
 
