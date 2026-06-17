@@ -991,7 +991,7 @@ def upsert_events(ws, events: List[dict]) -> Tuple[int, int, int, Set[str], Set[
     return added, updated, unchanged, active_iso, cancelled_iso, conflicts
 
 
-def mark_cancellations(ws, active_iso: Set[str], cancelled_iso: Set[str]) -> int:
+def mark_cancellations(ws, active_iso: Set[str], cancelled_iso: Set[str], year: int) -> int:
     headers = ensure_header(ws)
     col_index = {name: idx for idx, name in enumerate(headers)}
     iso_col = col_index.get("event_dt_iso")
@@ -1016,6 +1016,10 @@ def mark_cancellations(ws, active_iso: Set[str], cancelled_iso: Set[str]) -> int
             if iso_dt:
                 break
         if not iso_dt:
+            continue
+
+        # Skip rows from other years so a 2026 sync doesn't mark 2027 events cancelled.
+        if iso_dt.year != year:
             continue
 
         if iso_dt < now:
@@ -1176,7 +1180,7 @@ def sync_events(year: int = TARGET_YEAR, interactive: bool = False, auto_resolve
             cws.append(["Incoming Title", "Incoming ISO", "Incoming Display", "Candidate Row", "Candidate Title", "Candidate ISO"])
             for c in conflicts:
                 cws.append([c.get("incoming_title"), c.get("incoming_iso"), c.get("incoming_display"), c.get("candidate_row"), c.get("candidate_title"), c.get("candidate_iso")])
-    cancelled = mark_cancellations(ws, active_iso, cancelled_iso)
+    cancelled = mark_cancellations(ws, active_iso, cancelled_iso, year)
 
     # Compute Serial letters (A, B, C...) based on chronological decade/month stepping.
     headers = ensure_header(ws)
