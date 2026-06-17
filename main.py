@@ -1,4 +1,5 @@
 import argparse
+from copy import copy
 from datetime import datetime, timedelta
 from html import unescape
 import re
@@ -127,7 +128,7 @@ def fetch_events(location_id: str, year: int) -> List[dict]:
             )
         payload = response.json()
         events.extend(payload.get("data", []))
-        url = payload.get("next")
+        url = payload.get("meta", {}).get("next")
         params = None
 
     filtered = [e for e in events if _event_in_year(e, year)]
@@ -350,7 +351,11 @@ def ensure_header(ws) -> List[str]:
     # If no reasonable header found, create one at row 1
     if not best_row_idx or best_matches == 0:
         # preserve any existing content by inserting new row 1
-        ws.insert_rows(1)
+        first_row_has_content = any(
+            cell.value not in (None, "") for cell in ws[1]
+        )
+        if first_row_has_content:
+            ws.insert_rows(1)
         for idx, h in enumerate(HEADERS, start=1):
             ws.cell(row=1, column=idx).value = h
         return HEADERS
@@ -637,7 +642,9 @@ def _find_insert_row(ws, iso_dt: Optional[datetime]) -> int:
 def _set_row_strike(ws, row_idx: int, strike: bool) -> None:
     for cell in ws[row_idx]:
         current_font = cell.font or Font()
-        cell.font = current_font.copy(strike=strike)
+        new_font = copy(current_font)
+        new_font.strike = strike
+        cell.font = new_font
 
 
 def upsert_events(ws, events: List[dict]) -> Tuple[int, int, int, Set[str], Set[str]]:
