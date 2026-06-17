@@ -23,8 +23,9 @@ FUZZY_THRESHOLD = 0.65
 TOKEN_OVERLAP_THRESHOLD = 0.6
 MAX_DURATION_HOURS = 8  # sanity cap to avoid bogus long durations
 HEADERS = [
-    "Event_Title",
+    "NEW",
     "Event Date and Time",
+    "Event_Title",
     "Flyygeli",
     "Parking",
     "Extra_Charges",
@@ -39,12 +40,28 @@ HEADERS = [
     "ContactName",
     "e-mail",
     "Phone Number",
-    "Serial Teams",
+    "Serial",
     "Event Type",
+    "Calendar_Input",
     "Event Description",
     "Event Image",
     "event_dt_iso",
     "Notified",
+]
+# Columns populated from the API; existing rows are compared against these.
+API_BACKED_FIELDS = [
+    "Event_Title",
+    "Event Date and Time",
+    "Esitys_Alkaa",
+    "Esitys_Loppuu",
+    "weekday",
+    "date",
+    "Event Type",
+    "Event Description",
+    "Event Image",
+    "event_dt_iso",
+    "Kesto",
+    "Väliaika",
 ]
 WEEKDAY_MAP = {
     0: "ma",
@@ -314,23 +331,34 @@ def ensure_header(ws) -> List[str]:
 
     # synonyms mapping (normalized -> canonical)
     synonyms = {
+        _norm("new"): "NEW",
+        _norm("uusi"): "NEW",
+        _norm("event date and time"): "Event Date and Time",
+        _norm("eventdateandtime"): "Event Date and Time",
+        _norm("eventdatetime"): "Event Date and Time",
         _norm("event title"): "Event_Title",
         _norm("title"): "Event_Title",
         _norm("event_title"): "Event_Title",
-        _norm("eventdateandtime"): "Event Date and Time",
-        _norm("event date and time"): "Event Date and Time",
-        _norm("eventdatetime"): "Event Date and Time",
-        _norm("event_dt_iso"): "event_dt_iso",
-        _norm("eventdtiso"): "event_dt_iso",
         _norm("esitysalkaa"): "Esitys_Alkaa",
         _norm("esitysloppuu"): "Esitys_Loppuu",
         _norm("kesto"): "Kesto",
         _norm("valiaika"): "Väliaika",
         _norm("date"): "date",
         _norm("weekday"): "weekday",
-        _norm("eventdescription"): "Event Description",
-        _norm("event_image"): "Event Image",
+        _norm("serial teams"): "Serial",
+        _norm("serialteams"): "Serial",
+        _norm("serial"): "Serial",
         _norm("eventtype"): "Event Type",
+        _norm("event type"): "Event Type",
+        _norm("calendar_input"): "Calendar_Input",
+        _norm("calendarinput"): "Calendar_Input",
+        _norm("calendar input"): "Calendar_Input",
+        _norm("calendar"): "Calendar_Input",
+        _norm("eventdescription"): "Event Description",
+        _norm("event image"): "Event Image",
+        _norm("event_image"): "Event Image",
+        _norm("event_dt_iso"): "event_dt_iso",
+        _norm("eventdtiso"): "event_dt_iso",
     }
 
     # Search for the header row in the first 10 rows (or fewer)
@@ -375,6 +403,68 @@ def ensure_header(ws) -> List[str]:
         else:
             # keep unknown header as-is to preserve user layout
             normalized_headers.append(val if val is not None else "")
+
+    # Reorder columns to match the canonical HEADERS order. Unknown columns are
+    # kept at the end. We use insert_cols / delete_cols plus move_range so that
+    # formatting is preserved.
+    current_positions: Dict[str, int] = {}
+    for idx, h in enumerate(normalized_headers, start=1):
+        if h in HEADERS:
+            current_positions[h] = idx
+
+    for target_idx, h in enumerate(HEADERS, start=1):
+        current_idx = current_positions.get(h)
+        if current_idx is None:
+            continue
+        if current_idx != target_idx:
+            if target_idx < current_idx:
+                # Move column left: insert at target, move old source into the
+                # empty slot, then delete the now-empty source column.
+                ws.insert_cols(target_idx)
+                source_after_insert = current_idx + 1
+                src_letter = openpyxl.utils.get_column_letter(source_after_insert)
+                ws.move_range(
+                    f"{src_letter}{header_row}:{src_letter}{ws.max_row}",
+                    cols=target_idx - source_after_insert,
+                )
+                ws.delete_cols(source_after_insert)
+            else:
+                # Move column right: insert a column just past the target, move
+                # the source into that slot, then delete the original source.
+                ws.insert_cols(target_idx + 1)
+                source_after_insert = current_idx
+                src_letter = openpyxl.utils.get_column_letter(source_after_insert)
+                ws.move_range(
+                    f"{src_letter}{header_row}:{src_letter}{ws.max_row}",
+                    cols=(target_idx + 1) - source_after_insert,
+                )
+                ws.delete_cols(source_after_insert)
+
+            # Update positions of shifted columns
+            if target_idx < current_idx:
+                for key, pos in current_positions.items():
+                    if target_idx <= pos < current_idx:
+                        current_positions[key] = pos + 1
+            else:
+                for key, pos in current_positions.items():
+                    if current_idx < pos <= target_idx:
+                        current_positions[key] = pos - 1
+            current_positions[h] = target_idx
+
+    # Rebuild normalized_headers in the new order
+    normalized_headers = [ws.cell(row=header_row, column=idx).value for idx in range(1, ws.max_column + 1)]
+
+    # Reordering with insert/delete can leave empty trailing columns; clean them up.
+    while ws.max_column > 0:
+        last_col = ws.max_column
+        has_data = any(
+            ws.cell(row=r, column=last_col).value not in (None, "")
+            for r in range(1, ws.max_row + 1)
+        )
+        if has_data:
+            break
+        ws.delete_cols(last_col)
+        normalized_headers.pop()
 
     # Append any missing canonical headers at the end
     missing = [h for h in HEADERS if h not in normalized_headers]
@@ -588,6 +678,92 @@ def _coerce_day_key(value: object) -> Optional[str]:
     return None
 
 
+def _cell_value_eq(current: object, new: object, col: str) -> bool:
+    """Compare a worksheet cell value with an incoming API value.
+
+    Treats None and empty string as equal. For event_dt_iso, normalizes
+    both values to the canonical local ISO string before comparing.
+    """
+    if current is None or current == "":
+        current = None
+    if new is None or new == "":
+        new = None
+    if current is None and new is None:
+        return True
+    if current is None or new is None:
+        return False
+    if col == "event_dt_iso":
+        return _normalize_iso_key(current) == _normalize_iso_key(new)
+    return str(current) == str(new)
+
+
+def _is_changed_fill(cell_fill) -> bool:
+    """Return True if the cell fill matches the CHANGED_FILL (yellow)."""
+    return (
+        cell_fill is not None
+        and cell_fill.fill_type == "solid"
+        and cell_fill.fgColor is not None
+        and cell_fill.fgColor.rgb == CHANGED_FILL.fgColor.rgb
+    )
+
+
+def _number_to_letters(n: int) -> str:
+    """Convert 0 -> A, 1 -> B, ..., 25 -> Z, 26 -> AA, etc."""
+    letters: List[str] = []
+    while n >= 0:
+        letters.append(chr(ord("A") + (n % 26)))
+        n = n // 26 - 1
+    return "".join(reversed(letters))
+
+
+def _event_period_key(dt: datetime) -> Tuple[int, int, int]:
+    """Return a (year, month, day-decade) key used for Serial letter stepping.
+
+    Day-decade groups: 1-9 -> 0, 10-19 -> 1, 20-29 -> 2, 30-31 -> 3.
+    Month change also steps the letter, so month is part of the key.
+    """
+    return (dt.year, dt.month, dt.day // 10)
+
+
+def compute_serial_values(ws, headers: List[str]) -> Dict[int, str]:
+    """Compute Serial letters for all rows with an event_dt_iso.
+
+    Letters progress A, B, C... through the alphabet and then AA, AB, etc.
+    The letter advances whenever the (year, month, day-decade) period changes
+    from the previous event in chronological order.
+    """
+    col_index = {name: idx for idx, name in enumerate(headers)}
+    iso_col = col_index.get("event_dt_iso")
+    if iso_col is None:
+        return {}
+
+    rows: List[Tuple[datetime, int]] = []
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2), start=2):
+        iso_val = row[iso_col].value
+        if not iso_val:
+            continue
+        dt = _parse_iso_to_dt(iso_val)
+        if not dt:
+            continue
+        rows.append((dt, row_idx))
+
+    if not rows:
+        return {}
+
+    rows.sort(key=lambda x: x[0])
+    result: Dict[int, str] = {}
+    letter_index = 0
+    prev_key = None
+    for dt, row_idx in rows:
+        key = _event_period_key(dt)
+        if prev_key is None or key != prev_key:
+            if prev_key is not None:
+                letter_index += 1
+            prev_key = key
+        result[row_idx] = _number_to_letters(letter_index)
+    return result
+
+
 def build_day_titles(ws, headers: List[str]) -> Dict[str, List[Tuple[str, int]]]:
     col_index = {name: idx for idx, name in enumerate(headers)}
     date_idx = col_index.get("date")
@@ -661,6 +837,7 @@ def upsert_events(ws, events: List[dict]) -> Tuple[int, int, int, Set[str], Set[
     now = datetime.now(tz=LOCAL_TZ)
 
     conflicts: List[dict] = []
+    used_rows: Set[int] = set()
 
     for event in events:
         row_data = event_to_row(event)
@@ -692,16 +869,16 @@ def upsert_events(ws, events: List[dict]) -> Tuple[int, int, int, Set[str], Set[
         if iso_key:
             iso_cands = _normalize_iso_candidates(iso_key)
             for cand in iso_cands:
-                if cand in by_iso:
+                if cand in by_iso and by_iso[cand] not in used_rows:
                     matched_by_iso = by_iso[cand]
                     break
         if matched_by_iso:
             target_row = matched_by_iso
-        elif lookup_key in by_title_date:
+        elif lookup_key in by_title_date and by_title_date[lookup_key] not in used_rows:
             target_row = by_title_date[lookup_key]
         best_candidate = None
         best_match_count = 0
-        if day_key and day_key in by_day_titles:
+        if not target_row and day_key and day_key in by_day_titles:
             incoming_title = row_data.get("Event_Title") or ""
             incoming_norm = _normalize_title(incoming_title)
             incoming_words = set(incoming_norm.split())
@@ -710,6 +887,8 @@ def upsert_events(ws, events: List[dict]) -> Tuple[int, int, int, Set[str], Set[
 
             max_matching_words = 0
             for existing_title, row_idx in by_day_titles[day_key]:
+                if row_idx in used_rows:
+                    continue
                 existing_norm = _normalize_title(existing_title)
                 existing_words = set(existing_norm.split())
                 existing_words = {w for w in existing_words if len(w) >= 2}
@@ -748,36 +927,65 @@ def upsert_events(ws, events: List[dict]) -> Tuple[int, int, int, Set[str], Set[
                     })
 
         if target_row:
-            # Update the existing row's event_dt_iso cell to canonical value
-            unchanged += 1
-            try:
-                iso_col_idx = col_index.get("event_dt_iso")
-                # write the canonical normalized ISO if available
-                if iso_col_idx is not None and norm_iso:
-                    ws.cell(row=target_row, column=iso_col_idx + 1).value = norm_iso
-                _set_row_strike(ws, target_row, False)
-            except Exception:
-                pass
+            used_rows.add(target_row)
+            # Existing row: clear stale yellow fill from API-backed cells and
+            # re-apply yellow only to cells whose values actually changed.
+            changed = False
+            api_col_indices = [col_index[c] for c in API_BACKED_FIELDS if c in col_index]
+            for col_idx in api_col_indices:
+                cell = ws.cell(row=target_row, column=col_idx + 1)
+                if _is_changed_fill(cell.fill):
+                    cell.fill = PatternFill()
+
+            for col in API_BACKED_FIELDS:
+                col_idx = col_index.get(col)
+                if col_idx is None:
+                    continue
+                cell = ws.cell(row=target_row, column=col_idx + 1)
+                current_val = cell.value
+                new_val = row_data.get(col)
+                if new_val is None and col in MANUAL_DEFAULTS:
+                    new_val = MANUAL_DEFAULTS[col]
+                # Preserve manual values when the API doesn't provide the field
+                if new_val is None and current_val not in (None, ""):
+                    continue
+                if not _cell_value_eq(current_val, new_val, col):
+                    cell.value = new_val
+                    cell.fill = CHANGED_FILL
+                    changed = True
+
+            if changed:
+                updated += 1
+            else:
+                unchanged += 1
+
+            _set_row_strike(ws, target_row, False)
             if day_key and row_data.get("Event_Title"):
                 by_day_titles.setdefault(str(day_key), []).append((str(row_data["Event_Title"]), target_row))
         else:
             new_row = []
             for col in headers:
-                val = row_data.get(col)
-                if val is None and col in MANUAL_DEFAULTS:
-                    val = MANUAL_DEFAULTS[col]
+                if col == "NEW":
+                    val = "NEW"
+                else:
+                    val = row_data.get(col)
+                    if val is None and col in MANUAL_DEFAULTS:
+                        val = MANUAL_DEFAULTS[col]
                 new_row.append(val)
             insert_at = _find_insert_row(ws, iso_dt)
             ws.insert_rows(insert_at)
-            fill_for_new = RELATED_FILL if related_one_word else CHANGED_FILL
+            # New rows use the NEW indicator column instead of yellow.
+            # RELATED_FILL is kept only for ambiguous one-word matches.
+            fill_for_new = RELATED_FILL if related_one_word else None
             for idx, value in enumerate(new_row, start=1):
                 cell = ws.cell(row=insert_at, column=idx)
                 cell.value = value
-                if value not in (None, "") and HEADERS[idx - 1] in row_data:
+                if fill_for_new and value not in (None, "") and idx <= len(HEADERS) and HEADERS[idx - 1] in row_data:
                     cell.fill = fill_for_new
             _set_row_strike(ws, insert_at, False)
             if day_key and row_data.get("Event_Title"):
                 by_day_titles.setdefault(str(day_key), []).append((str(row_data["Event_Title"]), insert_at))
+            used_rows.add(insert_at)
             added += 1
 
     return added, updated, unchanged, active_iso, cancelled_iso, conflicts
@@ -933,14 +1141,19 @@ def sync_events(year: int = TARGET_YEAR, interactive: bool = False, auto_resolve
                 end_idx = col_index.get("Esitys_Loppuu")
                 if title_idx is not None and incoming_row.get("Event_Title"):
                     ws.cell(row=candidate_row, column=title_idx + 1).value = incoming_row.get("Event_Title")
+                    ws.cell(row=candidate_row, column=title_idx + 1).fill = CHANGED_FILL
                 if iso_idx is not None and incoming_row.get("event_dt_iso"):
                     ws.cell(row=candidate_row, column=iso_idx + 1).value = incoming_row.get("event_dt_iso")
+                    ws.cell(row=candidate_row, column=iso_idx + 1).fill = CHANGED_FILL
                 if evt_disp_idx is not None and incoming_row.get("Event Date and Time"):
                     ws.cell(row=candidate_row, column=evt_disp_idx + 1).value = incoming_row.get("Event Date and Time")
+                    ws.cell(row=candidate_row, column=evt_disp_idx + 1).fill = CHANGED_FILL
                 if start_idx is not None and incoming_row.get("Esitys_Alkaa"):
                     ws.cell(row=candidate_row, column=start_idx + 1).value = incoming_row.get("Esitys_Alkaa")
+                    ws.cell(row=candidate_row, column=start_idx + 1).fill = CHANGED_FILL
                 if end_idx is not None and incoming_row.get("Esitys_Loppuu"):
                     ws.cell(row=candidate_row, column=end_idx + 1).value = incoming_row.get("Esitys_Loppuu")
+                    ws.cell(row=candidate_row, column=end_idx + 1).fill = CHANGED_FILL
                 _set_row_strike(ws, candidate_row, False)
             print(f"Auto-resolved {len(conflicts)} conflicts (prefer_incoming).")
         elif auto_resolve == "prefer_existing":
@@ -954,6 +1167,26 @@ def sync_events(year: int = TARGET_YEAR, interactive: bool = False, auto_resolve
             for c in conflicts:
                 cws.append([c.get("incoming_title"), c.get("incoming_iso"), c.get("incoming_display"), c.get("candidate_row"), c.get("candidate_title"), c.get("candidate_iso")])
     cancelled = mark_cancellations(ws, active_iso, cancelled_iso)
+
+    # Compute Serial letters (A, B, C...) based on chronological decade/month stepping.
+    headers = ensure_header(ws)
+    col_index = {name: idx for idx, name in enumerate(headers)}
+    serial_col = col_index.get("Serial")
+    if serial_col is not None:
+        serial_updates = compute_serial_values(ws, headers)
+        for row_idx, serial_value in serial_updates.items():
+            cell = ws.cell(row=row_idx, column=serial_col + 1)
+            if not _cell_value_eq(cell.value, serial_value, "Serial"):
+                old_value = cell.value
+                cell.value = serial_value
+                # Only highlight as changed if a previous Serial value existed.
+                # Initial population is not highlighted to avoid a sea of yellow.
+                if old_value not in (None, ""):
+                    cell.fill = CHANGED_FILL
+            elif _is_changed_fill(cell.fill):
+                # Value is now correct; clear stale yellow highlight.
+                cell.fill = PatternFill()
+
     try:
         # If loading failed due to a locked file, avoid overwriting and save to alternate.
         if load_failed:
